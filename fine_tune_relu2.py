@@ -1,7 +1,7 @@
 ## 5070 issues - disable some of the kernels (~20% slower)
 """
 # activate the same venv
-source ~/Documents/repos/fine-tune-example/env/bin/activate
+source /env/bin/activate
 
 # wipe the conflicting wheels
 pip uninstall -y xformers flash-attn triton torch torchvision torchaudio
