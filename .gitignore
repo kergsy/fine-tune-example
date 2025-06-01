@@ -1,0 +1,31 @@
+env/
+
+# generated dirs
+*.egg-info
+__pycache__
+**/__pycache__
+.DS_Store
+.mypy_cache
+.pytest_cache
+.vscode
+*.swp
+data/
+
+# ignore dirs
+wandb/
+env/
+artifacts/weights/*.pth
+output/
+outputs/
+out/
+weights/*.pt
+
+# random ever growing list of random stuff
+*.csv
+*.log
+*.prof
+*.log
+Documentation/
+build/
+dist/
+runs/
