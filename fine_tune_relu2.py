@@ -54,17 +54,35 @@ TOK  = AutoTokenizer.from_pretrained(REPO, trust_remote_code=True)
 if TOK.pad_token is None:
     TOK.pad_token = TOK.eos_token
 
-# monkey-patch FFN → ReLU² (TurboSparse style)
-class ReLU2GLU(nn.Module):
-    def __init__(self, d_in, d_ff):
-        super().__init__()
-        self.w_up   = nn.Linear(d_in, d_ff, bias=False)
-        self.w_gate = nn.Linear(d_in, d_ff, bias=False)
-    def forward(self, x):
-        return self.w_up(x) * torch.relu(self.w_gate(x)) ** 2
+m_hgrn = importlib.import_module("mmfreelm.models.hgrn_bit.modeling_hgrn_bit")
+HGRNBitMLP = m_hgrn.HGRNBitMLP          # shorthand
 
-mflm = importlib.import_module("mmfreelm.layers.hgrn_bit")
-mflm.ReLU2GLU = ReLU2GLU        # overrides in all new layers
+def relu2_forward(self, x):
+    up_and_gate = self.gate_proj(x)     # shape [..., 2*intermediate]
+    gate, up = up_and_gate.chunk(2, -1)
+    y = torch.relu(gate)**2 * up        # <-- sparse ReLU² gating
+    return self.down_proj(y)
+
+# HGRNBitMLP.forward = relu2_forward      # global patch BEFORE model load
+
+def mlp_topk_forward(self, x, k_ratio: float = 0.02):     # keep 2 % activations
+    up_and_gate = self.gate_proj(x)                       # [..., 2*intermediate]
+    gate, up = up_and_gate.chunk(2, -1)
+
+    k = max(1, int(k_ratio * gate.shape[-1]))
+    topk_vals, _ = torch.topk(gate.abs(), k, dim=-1)
+    thresh = topk_vals[..., -1:]                          # broadcast min-top-k
+    mask   = (gate.abs() >= thresh).float()
+
+    sparsity = (mask == 0).float().mean().item() * 100    # % zeros
+    activation_sparsities.append(sparsity)
+
+    y = (gate * mask) * up                                # sparse product
+    return self.down_proj(y)                              # densifies afterward
+
+
+HGRNBitMLP.forward = mlp_topk_forward      # global patch BEFORE model load
+
 
 model = AutoModelForCausalLM.from_pretrained(
     REPO, torch_dtype="auto", device_map="auto", trust_remote_code=True
@@ -85,76 +103,62 @@ dataset = load_dataset("openwebtext", split="train[:1%]").map(
 )
 
 # Split dataset for training and evaluation
-train_size = int(0.9 * len(dataset))
-eval_size = len(dataset) - train_size
-train_dataset, eval_dataset = torch.utils.data.random_split(dataset, [train_size, eval_size])
+train_sz = int(0.9 * len(dataset))
+train_ds, eval_ds = torch.utils.data.random_split(dataset, [train_sz, len(dataset)-train_sz])
 
-# Global variable to store activations for sparsity measurement
+data_collator = DataCollatorForLanguageModeling(tokenizer=TOK, mlm=False)
+
+
 activation_sparsities = []
 
-def register_activation_hooks(model):
-    """Register hooks to capture MLP activations and measure sparsity"""
-    def hook_fn(module, input, output):
-        if isinstance(output, torch.Tensor):
-            sparsity = (output == 0).float().mean().item() * 100
-            activation_sparsities.append(sparsity)
-    
-    # Register hooks on MLP modules
-    for name, module in model.named_modules():
-        if 'mlp' in name and hasattr(module, 'forward'):
-            module.register_forward_hook(hook_fn)
+def hook_fn(_mod, _inp, out):
+    sparsity = (out == 0).float().mean().item() * 100
+    activation_sparsities.append(sparsity)
 
-# Register hooks to measure MLP activation sparsity
-register_activation_hooks(model)
+for mod in model.modules():
+    if isinstance(mod, HGRNBitMLP):
+        mod.register_forward_hook(hook_fn)
 
-# helper to measure sparsity on eval batch - FIXED for PEFT model
 @torch.no_grad()
 def pct_zero():
-    global activation_sparsities
     activation_sparsities.clear()
-    
     batch = next(iter(torch.utils.data.DataLoader(
-          eval_dataset, batch_size=16, collate_fn=data_collator)))
-    inputs = {k: v.to(model.device) for k, v in batch.items()}
+        eval_ds, batch_size=16, collate_fn=data_collator)))
+    batch = {k: v.to(model.device) for k, v in batch.items()}
+    model.eval(); model(**batch)                 # triggers hooks
+    return (sum(activation_sparsities) / len(activation_sparsities)) if activation_sparsities else 0.
 
-    # Forward pass (this will trigger our hooks)
-    model.eval()
-    _ = model(**inputs)
-    
-    # Return average sparsity across all captured activations
-    if activation_sparsities:
-        return sum(activation_sparsities) / len(activation_sparsities)
-    return 0.0
 
-# Trainer with sparsity callback - FIXED to work during training
 class SparsityCallback(transformers.TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
-        # Log sparsity every logging step
-        if state.global_step % args.logging_steps == 0 and state.global_step > 0:
-            sparsity = pct_zero()
-            print(f"Step {state.global_step:>5}: MLP activation sparsity = {sparsity:.1f}%")
-            logs["activation_sparsity"] = sparsity
-    
-    def on_evaluate(self, args, state, control, **kwargs):
-        sparsity = pct_zero()
-        print(f"Eval at step {state.global_step:>5}: MLP activation sparsity = {sparsity:.1f}%")
+        if state.global_step and state.global_step % args.logging_steps == 0:
+            logs = logs or {}
+            logs["activation_sparsity"] = pct_zero()
+            print(f"step {state.global_step:>5}  sparsity {logs['activation_sparsity']:.1f}%")
 
-# Use proper data collator for language modeling
-data_collator = DataCollatorForLanguageModeling(tokenizer=TOK, mlm=False)
+    def on_evaluate(self, args, state, control, **kwargs):
+        print(f"eval  {state.global_step:>5}  sparsity {pct_zero():.1f}%")
+
 
 args = TrainingArguments(
     "runs/sparse_lora370m",
     per_device_train_batch_size=4,
     gradient_accumulation_steps=4,
-    fp16=True, max_steps=1000,
-    learning_rate=2e-4, logging_steps=50,
-    eval_steps=200, save_steps=1000,
+    fp16=True,
+    max_steps=1000,
+    learning_rate=2e-4,
+    logging_steps=50,
+    eval_steps=200,
+    save_steps=1000,
 )
-trainer = Trainer(model, args, 
-                  train_dataset=train_dataset,  # Use split train dataset
-                  eval_dataset=eval_dataset,    # Add eval dataset for evaluation to trigger
-                  data_collator=data_collator,
-                  callbacks=[SparsityCallback()])
+trainer = Trainer(
+    model,
+    args,
+    train_dataset=train_ds,
+    eval_dataset=eval_ds,
+    data_collator=data_collator,
+    callbacks=[SparsityCallback()]
+)
 trainer.train()
 
 
